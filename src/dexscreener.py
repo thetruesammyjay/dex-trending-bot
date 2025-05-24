@@ -1,38 +1,58 @@
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime
+import tweepy
+import logging
 from typing import List, Dict
 from config.config import Config
-import logging
+from config.secrets import Config as Secrets
+from .database import DeduplicationDB
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
+db = DeduplicationDB()
 
-def get_top_trending_tokens() -> List[Dict[str, str]]:
-    """
-    Fetches top trending tokens from DexScreener
-    Returns list of dicts with 'name' and 'symbol' keys
-    """
+def setup_twitter_client() -> tweepy.Client:
+    return tweepy.Client(
+        bearer_token=Secrets.TWITTER_BEARER_TOKEN,
+        wait_on_rate_limit=True,
+        timeout=30
+    )
+
+def find_relevant_twitter_accounts(token: Dict[str, str]) -> List[Dict]:
+    client = setup_twitter_client()
+    query = f"{token['name']} OR {token['symbol']} -is:retweet has:verified"
+    
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-        }
-        response = requests.get(Config.DEXSCREENER_URL, headers=headers)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        tokens = []
-        
-        # This selector needs to be verified on live site
-        trending_items = soup.select('.trending-item')[:Config.TRENDING_TOKENS_LIMIT]
-        
-        for item in trending_items:
-            name = item.select('.token-name')[0].text.strip()
-            symbol = item.select('.token-symbol')[0].text.strip()
-            tokens.append({'name': name, 'symbol': symbol})
-            
-        logger.debug(f"Fetched {len(tokens)} trending tokens")
-        return tokens
-        
-    except Exception as e:
-        logger.error(f"Failed to fetch trending tokens: {str(e)}")
+        response = client.search_recent_tweets(
+            query=query,
+            max_results=Config.TWITTER_MAX_RESULTS,
+            tweet_fields=['author_id', 'created_at'],
+            user_fields=['username', 'verified', 'public_metrics'],
+            expansions=['author_id']
+        )
+        return process_response(response, token)
+    except tweepy.TweepyException as e:
+        logger.error(f"Twitter search failed: {str(e)}")
         return []
+
+def process_response(response, token: Dict[str, str]) -> List[Dict]:
+    if not response.includes or 'users' not in response.includes:
+        return []
+    
+    valid_accounts = []
+    for user in response.includes['users']:
+        if (user.verified and 
+            user.public_metrics['followers_count'] >= Config.MIN_FOLLOWERS):
+            account_id = f"{user.username}_{token['symbol']}"
+            
+            if not db.is_duplicate(account_id, token['symbol']):
+                valid_accounts.append({
+                    'username': user.username,
+                    'followers': user.public_metrics['followers_count'],
+                    'url': f"https://twitter.com/{user.username}",
+                    'token_name': token['name'],
+                    'token_symbol': token['symbol'],
+                    'timestamp': datetime.now().isoformat()
+                })
+                db.record_account(account_id, token['symbol'])
+    
+    db.cleanup_old_records()
+    return valid_accounts
